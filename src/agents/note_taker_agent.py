@@ -160,8 +160,16 @@ class NoteTakerAgent(BaseAgent):
         pass
 
     def _route_after_extract(self, state: AgentState) -> str:
-        """处理任务后的路由决策"""
-        pass
+        """任务提取后的路由决策
+
+        Args:
+            state: 当前状态对象
+
+        Returns:
+            str: 下一个节点名称
+        """
+        # 移除任务检查，始终进入 create_tasks
+        return "create_tasks"
 
     def _create_workflow(self) -> StateGraph:
         """创建工作流程图"""
@@ -173,7 +181,6 @@ class NoteTakerAgent(BaseAgent):
         workflow.add_node("format_content", self._format_content)  # 内容格式化
         workflow.add_node("save_notion", self._save_to_notion)  # 保存到Notion
         workflow.add_node("extract_tasks", self._extract_tasks)  # 提取任务
-        workflow.add_node("format_tasks", self._format_tasks)  # 格式化任务
         workflow.add_node("create_tasks", self._create_tasks)  # 创建任务
 
         # 2. 设置工作流路径
@@ -202,22 +209,12 @@ class NoteTakerAgent(BaseAgent):
             lambda x: self._route_after_save(x),
             {
                 "extract_tasks": "extract_tasks",  # 有文本内容，提取任务
-                END: END,  # 无文本内容，结束
+                "create_tasks": "create_tasks",  # 无文本内容，直接到创建任务生成报告
             },
         )
 
-        # 任务提取后的路由
-        workflow.add_conditional_edges(
-            "extract_tasks",
-            lambda x: self._route_after_extract(x),
-            {
-                "format_tasks": "format_tasks",  # 提取成功，格式化任务
-                END: END,  # 提取失败，结束
-            },
-        )
-
-        # 任务格式化到创建任务
-        workflow.add_edge("format_tasks", "create_tasks")
+        # 任务提取到创建任务（无条件）
+        workflow.add_edge("extract_tasks", "create_tasks")
 
         # 创建任务到结束
         workflow.add_edge("create_tasks", END)
@@ -255,20 +252,6 @@ class NoteTakerAgent(BaseAgent):
 
         if has_text and save_success:
             return "extract_tasks"
-        return END
-
-    def _route_after_extract(self, state: AgentState) -> str:
-        """任务提取后的路由决策
-
-        Args:
-            state: 当前状态对象
-
-        Returns:
-            str: 下一个节点名称
-        """
-        tasks = state.get("tasks")
-        if tasks:
-            return "format_tasks"
         return END
 
     async def _parallel_process(self, state: AgentState) -> Dict:
@@ -360,7 +343,7 @@ class NoteTakerAgent(BaseAgent):
         """格式化内容节点
 
         Args:
-            state: 当前状态对象
+            state: 当前状对象
 
         Returns:
             Dict: 更新后的状态对象
@@ -436,7 +419,7 @@ class NoteTakerAgent(BaseAgent):
                     status=MessageStatus.PROCESSING,
                     step=ProcessStep.SAVING_TO_NOTION,
                     progress=0.8,
-                    description="✅ 已保存到 Notion",
+                    description="已保存到 Notion",
                     status_message_id=status_message_id,
                     emoji="✅",
                 )
@@ -456,7 +439,7 @@ class NoteTakerAgent(BaseAgent):
 
             self.logger.error(f"保存到 Notion 失败: {error_msg}", exc_info=True)
 
-            # 更新错误��态
+            # 更新错误态
             if self.telegram_status_updater and status_message_id:
                 await self._update_status(
                     message=message,
@@ -465,6 +448,7 @@ class NoteTakerAgent(BaseAgent):
                     progress=0.0,
                     description=f"❌ {error_msg}",
                     status_message_id=status_message_id,
+                    show_progress=False,  # 错误时不显示进度条
                 )
 
             # 返回错误状态
@@ -487,17 +471,18 @@ class NoteTakerAgent(BaseAgent):
                     status=MessageStatus.PROCESSING,
                     step=ProcessStep.TASK_EXTRACTION,
                     progress=0.95,
-                    description="📌 正在提取任务...",
+                    description="正在提取任务...",
                     status_message_id=status_message_id,
                     emoji="📌",
                 )
+
             self.logger.debug(f"提取任务背景: {self.user_background}")
             content = state["text_content"]
+
             # 解析背景信息JSON
             try:
                 background_data = json.loads(self.user_background)
                 profile = background_data.get("profile", "")
-                # 获取项目列表并提取项目名称
                 projects_data = background_data.get("dida", {}).get("projects", [])
                 project_names = str([p["name"] for p in projects_data if "name" in p])
             except json.JSONDecodeError:
@@ -511,10 +496,22 @@ class NoteTakerAgent(BaseAgent):
                 projects=project_names,
             )
 
-            return {**state, "tasks": tasks, "next": "create_tasks" if tasks else END}
+            # 修改这里：无论是否有任务，都进入 create_tasks
+            # 让 create_tasks 负责生成最终报告
+            return {**state, "tasks": tasks, "next": "create_tasks"}
 
         except Exception as e:
             self.logger.error(f"提取任务: {e}", exc_info=True)
+            if self.telegram_status_updater and status_message_id:
+                await self._update_status(
+                    message=message,
+                    status=MessageStatus.FAILED,
+                    step=ProcessStep.ERROR,
+                    progress=0.0,
+                    description=f"❌ 提取任务失败: {str(e)}",
+                    status_message_id=status_message_id,
+                    show_progress=False,
+                )
             return {**state, "error_message": f"提取任务失败: {str(e)}", "next": END}
 
     async def _create_tasks(self, state: AgentState) -> Dict:
@@ -524,122 +521,230 @@ class NoteTakerAgent(BaseAgent):
             status_message_id = state.get("status_message_id")
             tasks = state.get("tasks", [])
             user_id = message.metadata.user_id
+            format_content_result = state.get("format_content_result", {})
 
-            if not tasks:
-                self.logger.info("没有任务需要创建")
-                return {**state, "next": END}
+            # 如果有任务，才进行任务创建
+            if tasks:
+                # 更新状态：开始创建任务
+                if self.telegram_status_updater and status_message_id:
+                    await self._update_status(
+                        message=message,
+                        status=MessageStatus.PROCESSING,
+                        step=ProcessStep.CREATING_TASKS,
+                        progress=0.98,
+                        description="正在创建任务...",
+                        status_message_id=status_message_id,
+                    )
 
-            # 更新状态：开始创建任务
-            if self.telegram_status_updater and status_message_id:
-                await self._update_status(
-                    message=message,
-                    status=MessageStatus.PROCESSING,
-                    step=ProcessStep.CREATING_TASKS,
-                    progress=0.98,
-                    description="✅ 正在创建任务...",
-                    status_message_id=status_message_id,
-                    emoji="📝",
+                # 获取滴答清单服务
+                self.logger.info(f"正在获取滴答清单服务: user_id={user_id}")
+
+                # 检查用户配置
+                token_info = self.config.get_user_value(user_id, "dida.token")
+                self.logger.debug(f"用户token配置: {token_info}")
+
+                projects_config = self.config.get_user_value(user_id, "dida.projects")
+                self.logger.debug(f"用户项目配置: {projects_config}")
+
+                dida_service = self.config.get_service("dida365", user_id)
+                if not dida_service:
+                    self.logger.error(f"获取滴答清单服务失败: user_id={user_id}")
+                    return {
+                        **state,
+                        "error_message": "请先配置滴答清单服务",
+                        "next": END,
+                    }
+
+                # 获取用户的项目列表配置
+                projects_config = self.config.get_user_value(
+                    user_id, "dida.projects", default=[]
                 )
+                self.logger.debug(f"项目配置: {projects_config}")
 
-            # 获取滴答清单服务
-            self.logger.info(f"正在获取滴答清单服务: user_id={user_id}")
+                # 创建项目名称到ID的映射
+                project_map = {p["name"]: p["id"] for p in projects_config}
+                self.logger.debug(f"项目映射: {project_map}")
 
-            # 检查用户配置
-            token_info = self.config.get_user_value(user_id, "dida.token")
-            self.logger.debug(f"用户token配置: {token_info}")
+                results = []
+                for task in tasks:
+                    try:
+                        # 从task中提取所需字段
+                        project_name = task.get('projectId')
+                        # 根据项目名称获取项目ID
+                        project_id = project_map.get(project_name)
+                        if not project_id and project_name:
+                            self.logger.warning(f"找不到项目ID: {project_name}")
+                            results.append(f"⚠️ 找不到项目: {project_name}")
+                            continue
 
-            projects_config = self.config.get_user_value(user_id, "dida.projects")
-            self.logger.debug(f"用户项目配置: {projects_config}")
+                        title = task.get('title')
+                        content = task.get('content')
+                        due_date = (
+                            datetime.fromisoformat(
+                                task['dueDate'].replace('Z', '+00:00')
+                            )
+                            if task.get('dueDate')
+                            else None
+                        )
+                        priority = task.get('priority', 0)
+                        is_all_day = task.get('isAllDay', False)
+                        reminders = task.get('reminders', [])
+                        desc = task.get('desc', '')
 
-            dida_service = self.config.get_service("dida365", user_id)
-            if not dida_service:
-                self.logger.error(f"获取滴答清单服务失败: user_id={user_id}")
-                return {**state, "error_message": "请先配置滴答清单服务", "next": END}
+                        # 创建任务
+                        created_task = await dida_service.add_task(
+                            user_id=user_id,
+                            title=title,
+                            content=content,
+                            project_id=project_id,  # 使用项目ID而不是名称
+                            desc=desc,
+                            due_date=due_date,
+                            priority=priority,
+                            is_all_day=is_all_day,
+                            reminders=reminders,
+                        )
 
-            # 获取用户的项目列表配置
-            projects_config = self.config.get_user_value(
-                user_id, "dida.projects", default=[]
-            )
-            self.logger.debug(f"项目配置: {projects_config}")
+                        if created_task:
+                            # 构建任务描述
+                            task_desc = f"✅ 已创建任务: {title}"
+                            if project_name:
+                                task_desc += f"\n📁 项目: {project_name}"
+                            if due_date:
+                                formatted_date = due_date.strftime("%Y-%m-%d %H:%M")
+                                task_desc += f"\n⏰ 截止时间: {formatted_date}"
+                            if priority > 0:
+                                priority_map = {1: "低", 3: "中", 5: "高"}
+                                task_desc += (
+                                    f"\n🔥 优先级: {priority_map.get(priority, '普通')}"
+                                )
 
-            # 创建项目名称到ID的映射
-            project_map = {p["name"]: p["id"] for p in projects_config}
-            self.logger.debug(f"项目映射: {project_map}")
+                            results.append(task_desc)
+                            self.logger.info(f"成功创建任务: {title}")
 
-            results = []
-            for task in tasks:
-                try:
-                    # 从task中提取所需字段
-                    project_name = task.get('projectId')
-                    # 根据项目名称获取项目ID
-                    project_id = project_map.get(project_name)
-                    if not project_id and project_name:
-                        self.logger.warning(f"找不到项目ID: {project_name}")
-                        results.append(f"⚠️ 找不到项目: {project_name}")
-                        continue
+                    except Exception as e:
+                        error_msg = f"❌ 创建任务 '{title}' 失败: {str(e)}"
+                        results.append(error_msg)
+                        self.logger.error(f"创建任务失败: {str(e)}")
 
-                    title = task.get('title')
-                    content = task.get('content')
-                    due_date = (
-                        datetime.fromisoformat(task['dueDate'].replace('Z', '+00:00'))
-                        if task.get('dueDate')
-                        else None
-                    )
-                    priority = task.get('priority', 0)
-                    is_all_day = task.get('isAllDay', False)
-                    reminders = task.get('reminders', [])
-                    desc = task.get('desc', '')
+            # 无论是否有任务，都生成完成报告
+            if self.telegram_status_updater and status_message_id:
+                # 构建完成报告
+                report_lines = []
 
-                    # 创建任务
-                    created_task = await dida_service.add_task(
-                        user_id=user_id,
-                        title=title,
-                        content=content,
-                        project_id=project_id,  # 使用项目ID而不是名称
-                        desc=desc,
-                        due_date=due_date,
-                        priority=priority,
-                        is_all_day=is_all_day,
-                        reminders=reminders,
-                    )
+                # 添加顶部标题
+                report_lines.append("✨ 处理完成")
+                report_lines.append("")  # 空行分隔
 
-                    if created_task:
-                        # 构建任务描述
-                        task_desc = f"✅ 已创建任务: {title}"
-                        if project_name:
-                            task_desc += f"\n📁 项目: {project_name}"
+                # Notion保存信息
+                if state.get("save_success"):
+                    content_type = format_content_result.get("content_type", "未分类")
+                    tags = format_content_result.get("tags", [])
+                    title = format_content_result.get("title", "")
+
+                    report_lines.append("├─ 📝 笔记信息")
+                    report_lines.append("│  ├─ ✅ 已保存到 Notion")
+                    if title:
+                        report_lines.append(f"│  ├─ 📌 {title}")
+                    report_lines.append(f"│  ├─ 📑 分类: #{content_type}")
+                    if tags:
+                        formatted_tags = " ".join([f"#{tag}" for tag in tags])
+                        # 如果标签太长，进行换行处理
+                        max_length = 30
+                        if len(formatted_tags) > max_length:
+                            tags_lines = []
+                            current_line = "│  ├─ 🏷️ 标签: "
+                            for i, tag in enumerate([f"#{tag}" for tag in tags]):
+                                if len(current_line + tag) > max_length:
+                                    if i == len(tags) - 1:
+                                        tags_lines.append(
+                                            current_line.replace("├─", "└─")
+                                        )
+                                    else:
+                                        tags_lines.append(current_line)
+                                    current_line = "│  │  " + tag
+                                else:
+                                    current_line += f" {tag}"
+                            tags_lines.append(current_line.replace("├─", "└─"))
+                            report_lines.extend(tags_lines)
+                        else:
+                            report_lines.append(f"│  └─ 🏷️ 标签: {formatted_tags}")
+                    else:
+                        report_lines.append("│  └─ 🏷️ 无标签")
+
+                # 任务信息（即使没有任务也显示）
+                if tasks:
+                    report_lines.append("")  # 空行分隔
+                    report_lines.append(f"├─ 📋 任务信息 ({len(tasks)})")
+                    # 添加每个任务的详细信息
+                    for i, task in enumerate(tasks, 1):
+                        title = task.get('title', '')
+                        project = task.get('projectId', '')
+                        due_date = task.get('dueDate')
+                        priority = task.get('priority', 0)
+                        content = task.get('content', '')
+
+                        is_last_task = i == len(tasks)
+                        prefix = "└─" if is_last_task else "├─"
+                        detail_prefix = "   " if is_last_task else "│  "
+
+                        # 任务标题
+                        report_lines.append(f"│  {prefix} {i}. {title}")
+
+                        # 任务详细信息
+                        details = []
+                        if project:
+                            details.append(f"│  {detail_prefix}├─  {project}")
                         if due_date:
-                            formatted_date = due_date.strftime("%Y-%m-%d %H:%M")
-                            task_desc += f"\n⏰ 截止时间: {formatted_date}"
+                            date = datetime.fromisoformat(
+                                due_date.replace('Z', '+00:00')
+                            )
+                            formatted_date = date.strftime("%Y-%m-%d %H:%M")
+                            details.append(f"│  {detail_prefix}├─ ⏰ {formatted_date}")
                         if priority > 0:
                             priority_map = {1: "低", 3: "中", 5: "高"}
-                            task_desc += (
-                                f"\n🔥 优先级: {priority_map.get(priority, '普通')}"
+                            priority_text = priority_map.get(priority, '普通')
+                            details.append(
+                                f"│  {detail_prefix}├─ 🔥 {priority_text}优先级"
                             )
+                        if content:
+                            max_content_length = 40
+                            displayed_content = (
+                                f"{content[:max_content_length]}..."
+                                if len(content) > max_content_length
+                                else content
+                            )
+                            details.append(
+                                f"│  {detail_prefix}└─ 📝 {displayed_content}"
+                            )
+                        elif details:  # 如果有其他详情，将最后一项改为 └─
+                            details[-1] = details[-1].replace("├─", "└─")
 
-                        results.append(task_desc)
-                        self.logger.info(f"成功创建任务: {title}")
+                        report_lines.extend(details)
 
-                except Exception as e:
-                    error_msg = f"❌ 创建任务 '{title}' 失败: {str(e)}"
-                    results.append(error_msg)
-                    self.logger.error(f"创建任务失败: {str(e)}")
+                        if not is_last_task:
+                            report_lines.append("│")
+                else:
+                    # 如果没有任务，也添加任务信息部分
+                    report_lines.append("")  # 空行分隔
+                    report_lines.append("└─ 📋 未检测到任务")
 
-            # 更新状态：任务创建完成
-            if self.telegram_status_updater and status_message_id:
+                # 添加结尾分隔符
+                report_lines.append("")  # 空行
+                report_lines.append("· · · · · ·")  # 优雅的点状分隔符
+
+                # 更新状态消息为完成报告
                 await self._update_status(
                     message=message,
                     status=MessageStatus.COMPLETED,
                     step=ProcessStep.COMPLETED,
-                    progress=1.0,
-                    description=f"✅ 已创建 {len(results)} 个任务",
+                    progress=None,
+                    description="\n".join(report_lines).strip(),
                     status_message_id=status_message_id,
-                    emoji="✨",
+                    show_progress=False,
                 )
 
             return {
                 **state,
-                "messages": "这是什么",
                 "next": END,
             }
 
@@ -653,7 +758,7 @@ class NoteTakerAgent(BaseAgent):
                     progress=0.0,
                     description=f"❌ 创建任务失败: {str(e)}",
                     status_message_id=status_message_id,
-                    emoji="❌",
+                    show_progress=False,
                 )
             return {**state, "error_message": str(e), "next": END}
 
@@ -666,19 +771,33 @@ class NoteTakerAgent(BaseAgent):
         description: str,
         status_message_id: Optional[str] = None,
         emoji: str = "",
+        show_progress: bool = True,
     ) -> Optional[Message]:
-        """更新处理状态"""
+        """更新处理状态
+
+        Args:
+            message: 消息对象
+            status: 消息状态
+            step: 处理步骤
+            progress: 进度值(0-1)
+            description: 状态描述
+            status_message_id: 状态消息ID
+            emoji: 状态emoji
+            show_progress: 是否显示进度条
+        """
         try:
             if not self.telegram_status_updater:
                 return None
 
             # 构建状态文本
             status_text = self.telegram_status_updater.format_status_text(
-                progress=progress, step=step.value, description=description, emoji=emoji
+                progress=progress if show_progress else None,
+                step=step.value,
+                description=description,
+                emoji=emoji,
             )
 
             if status_message_id:
-                # 更新现有状态消息
                 success = await self.telegram_status_updater.update_status_message(
                     message_id=status_message_id, text=status_text
                 )
@@ -686,7 +805,6 @@ class NoteTakerAgent(BaseAgent):
                     self.logger.warning(f"更新状态消息失败: {status_message_id}")
                 return None
             else:
-                # 首次创建状态消息
                 return await self.telegram_status_updater.create_status_message(
                     chat_id=str(message.metadata.chat_id),
                     text=status_text,
@@ -766,24 +884,12 @@ class NoteTakerAgent(BaseAgent):
 
             self.logger.info("工作流执行完成")
 
-            # 处理完成后更新状态 - 只在成功时更新
-            if not final_state.get("error_message"):
-                if self.telegram_status_updater and status_message_id:
-                    await self._update_status(
-                        message=message,
-                        status=MessageStatus.COMPLETED,
-                        step=ProcessStep.COMPLETED,
-                        progress=1.0,
-                        description="✨ 处理完成",
-                        status_message_id=status_message_id,
-                    )
-
+            # 移除这里的状态更新，因为已经在 _create_tasks 中处理了
             self.logger.info("消息处理完成")
             return final_state.get("results", {})
 
         except Exception as e:
             self.logger.error(f"处理消息失败: {e}", exc_info=True)
-            # 错误时只发送一条错误消息
             if self.telegram_status_updater and status_message_id:
                 error_msg = str(e)
                 if ": " in error_msg:
@@ -795,6 +901,7 @@ class NoteTakerAgent(BaseAgent):
                     progress=0.0,
                     description=f"❌ {error_msg}",
                     status_message_id=status_message_id,
+                    show_progress=False,
                 )
             return {"error": str(e)}
 

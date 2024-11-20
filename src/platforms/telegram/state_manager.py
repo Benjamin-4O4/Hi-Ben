@@ -225,26 +225,33 @@ class TelegramStateManager:
         self._menu_states.pop(user_id, None)
 
     def format_status_text(
-        self, progress: float, step: str, description: str, emoji: str = "💫"
+        self, progress: Optional[float], step: str, description: str, emoji: str = ""
     ) -> str:
-        """格式化状态文本"""
-        # 检查描述中是否已有emoji
-        has_emoji = any(
-            char in description
-            for char in ('🔄', '🎤', '🔍', '🤖', '✨', '💾', '✅', '❌', '📋', '📌')
-        )
+        """格式化状态文本
 
-        # 进度条样式
-        bar_length = 20
-        filled_length = int(progress * bar_length)
-        filled = "█" * filled_length
-        empty = "░" * (bar_length - filled_length)
-        bar = filled + empty
+        Args:
+            progress: 进度值(0-1)或None
+            step: 处理步骤
+            description: 状态描述
+            emoji: 状态emoji
 
-        # 如果描述已包含emoji，不添加新的emoji
-        desc = description if has_emoji else f"{emoji} {description}"
+        Returns:
+            str: 格式化后的状态文本
+        """
+        # 构建状态文本
+        if emoji:
+            description = f"{emoji} {description}"
 
-        return f"{desc}\n{bar} {int(progress * 100):3d}%"
+        # 如果有进度值，显示进度条
+        if progress is not None:
+            # 使用更短的进度条，并将百分比放在同一行
+            bar_length = 10  # 减少进度条长度
+            filled_length = int(progress * bar_length)
+            bar = "█" * filled_length + "░" * (bar_length - filled_length)
+            # 进度条单独一行
+            description = f"{description}\n{bar} {int(progress * 100)}%"
+
+        return description
 
     async def update_status(
         self,
