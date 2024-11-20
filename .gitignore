@@ -1,0 +1,47 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.VSCodeCounter
+
+# Project specific
+logs/
+*.log
+tokens.json
+.env 
+
+# 忽略 data 目录
+data/*
+# 不忽略 data/config 目录
+!data/config/
+# 忽略 data/config 下所有文件
+data/config/*
+# 不忽略示例配置文件
+!data/config/system_config.yml.example

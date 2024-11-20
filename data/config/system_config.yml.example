@@ -1,0 +1,17 @@
+openai:
+  api_key:
+  base_url:
+  model: #默认模型
+
+telegram:
+  bot_token: "you_token"
+  allowed_users:
+    - "userid1"
+    - "userid2"
+
+dida:
+  redirect_uri: "http://127.0.0.1:8000/dida/callback"
+
+whisper:
+  model: "base" # tiny, base, small, medium, large
+  device: "cuda" # cuda 或 cpu
